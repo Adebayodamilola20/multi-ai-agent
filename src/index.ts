@@ -2,7 +2,7 @@ import cron from 'node-cron';
 import { managerAgent } from './agents/manager.agent';
 import { watcherAgent } from './agents/watcher.agent';
 import { discordAgent } from './agents/discord.agent';
-import { jarvisAgent } from './agents/jarvis.agent';
+import { voiceAgent } from './agents/voice.agent';
 import { neoAgent } from './agents/neo.agent';
 import { config, validateConfig } from './config';
 import { createAgentLogger } from './logger/logger';
@@ -14,14 +14,33 @@ const logger = createAgentLogger('system');
 async function bootstrap(): Promise<void> {
   validateConfig();
 
+  // Log selected providers at startup
+    logger.info('Provider configuration', {
+      llmProvider: config.useNvidia ? 'NVIDIA' : config.useOllamaFallback ? 'Ollama' : 'none',
+      sttProvider: config.sttProvider,
+      ttsProvider: config.ttsProvider,
+      brainProvider: config.base44.brainProvider || 'base44'
+    });
+    if (config.base44.brainProvider?.toLowerCase() === 'base44') {
+      logger.info('Base44 configuration loaded', {
+        brainProvider: config.base44.brainProvider,
+        baseUrl: config.base44.agentBaseUrl ? 'configured' : 'missing',
+        conversationId: config.base44.conversationId ? 'configured' : 'missing',
+        apiKey: config.base44.apiKey ? 'configured' : 'missing'
+      });
+    }
+
+
   const app = createApp();
   managerAgent.start();
-  try {
-    await discordAgent.start();
-  } catch (error) {
-    logger.error('Discord bot failed to start (server continues without it)', { error: (error as Error).message });
+  if (config.discordEnabled) {
+    try {
+      await discordAgent.start();
+    } catch (error) {
+      logger.error('Discord bot failed to start (server continues without it)', { error: (error as Error).message });
+    }
   }
-  await jarvisAgent.start();
+  await voiceAgent.start();
   await neoAgent.start();
 
   cron.schedule('*/60 * * * * *', () => {
@@ -48,15 +67,15 @@ async function bootstrap(): Promise<void> {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-  void startJarvisLoop();
+  void startVoiceLoop();
 }
 
-async function startJarvisLoop(): Promise<void> {
+async function startVoiceLoop(): Promise<void> {
   while (true) {
     try {
-      await jarvisAgent.listenForCommand();
+      await voiceAgent.runCycle();
     } catch (error) {
-      logger.error('JARVIS loop error', { error: (error as Error).message });
+      logger.error('Voice loop error', { error: (error as Error).message });
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }

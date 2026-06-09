@@ -1,126 +1,136 @@
 import { execFile, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import { createReadStream, unlinkSync } from 'fs';
-import OpenAI from 'openai';
 import { config } from '../config';
 import { createAgentLogger } from '../logger/logger';
+import { VoiceProvider } from './voice-provider';
+import { MacOsSayProvider, NvidiaTtsProvider, PiperTtsProvider, ElevenLabsTtsProvider, OpenAiVoiceProvider } from './tts-providers';
+import { SpeechToTextProvider, FasterWhisperProvider } from './speech-to-text-provider';
+
+// No‑op STT provider for text‑only mode
+class NoOpSttProvider implements SpeechToTextProvider {
+  async transcribe(_audioPath: string): Promise<string> {
+    // No transcription needed when using text input mode
+    return '';
+  }
+}
+const logger = createAgentLogger('voice-service');
 
 const execFileAsync = promisify(execFile);
 
-const logger = createAgentLogger('voice-service');
-
+// -------------------------------------------------------
+// Configuration – choose providers via env vars (fallbacks provided)
+// -------------------------------------------------------
 const AUDIO_PATH = '/tmp/jarvis_input.wav';
-const TTS_SPEAKER = process.env.JARVIS_VOICE || 'Carter';
 
-let currentPlayProcess: ChildProcess | null = null;
+// TTS provider selection (default: macOS Say)
+let ttsProvider: VoiceProvider;
+switch (config.ttsProvider) {
+  case 'nvidia':
+    ttsProvider = new NvidiaTtsProvider();
+    break;
+  case 'piper':
+    ttsProvider = new PiperTtsProvider();
+    break;
+  case 'elevenlabs':
+    ttsProvider = new ElevenLabsTtsProvider();
+    break;
+  case 'openai':
+    ttsProvider = new OpenAiVoiceProvider();
+    break;
+  case 'macos':
+  default:
+    ttsProvider = new MacOsSayProvider();
+}
+
+// Speech‑to‑Text provider (default: Faster‑Whisper)
+let sttProvider: SpeechToTextProvider;
+switch (config.sttProvider) {
+  case 'parakeet':
+    logger.warn('NVIDIA Parakeet API endpoint not configured. Use Faster-Whisper or provide official endpoint.');
+    // fallthrough to faster-whisper as fallback
+  case 'faster-whisper':
+    sttProvider = new FasterWhisperProvider();
+    break;
+  case 'text':
+    sttProvider = new NoOpSttProvider();
+    break;
+  default:
+    sttProvider = new FasterWhisperProvider();
+    break;
+}
+
+
 
 export class VoiceService {
-  // groq client retained for audio transcription — local LLM models don't support whisper/audio
-  private openai: OpenAI | null = null;
+  private audioAvailable = false;
+  private audioCheckPerformed = false;
 
-  private get client(): OpenAI {
-    if (!this.openai) {
-      this.openai = new OpenAI({ apiKey: config.groq.apiKey, baseURL: config.groq.baseUrl });
-    }
-    return this.openai;
-  }
-
+  // -----------------------------------------------------------------
+  // Text‑to‑Speech
+  // -----------------------------------------------------------------
   async speak(text: string): Promise<void> {
-    this.stopSpeaking();
-
     try {
-      // Generate audio via VibeVoice
-      const { stdout } = await execFileAsync('python3', [
-        'scripts/tts_vibevoice.py',
-        '--text', text,
-        '--speaker', TTS_SPEAKER
-      ]);
-      const wavPath = stdout.trim();
-
-      // Play the generated WAV
-      await new Promise<void>((resolve, reject) => {
-        currentPlayProcess = execFile('afplay', [wavPath]);
-        currentPlayProcess!.on('exit', () => {
-          currentPlayProcess = null;
-          // Cleanup temp file
-          try { unlinkSync(wavPath); } catch { /* ignore */ }
-          resolve();
-        });
-        currentPlayProcess!.on('error', (err) => {
-          currentPlayProcess = null;
-          try { unlinkSync(wavPath); } catch { /* ignore */ }
-          reject(err);
-        });
-      });
-    } catch (error) {
-      logger.warn('TTS failed (VibeVoice). Falling back to macOS say.', { error: (error as Error).message });
-      try {
-        await execFileAsync('say', ['-v', 'Daniel', text]);
-      } catch { /* silent fallback */ }
+      await ttsProvider.speak(text);
+    } catch (e) {
+      logger.warn('Primary TTS provider failed, falling back to macOS say', { error: (e as Error).message });
+      // fallback – ensure we always have a voice
+      const fallback = new MacOsSayProvider();
+      await fallback.speak(text);
     }
   }
 
-  stopSpeaking(): void {
-    if (currentPlayProcess) {
-      currentPlayProcess.kill('SIGTERM');
-      currentPlayProcess = null;
-    }
+  async stopSpeaking(): Promise<void> {
+    await ttsProvider.stop();
   }
+
+  // -----------------------------------------------------------------
+  // Speech‑to‑Text (record → transcribe)
+  // -----------------------------------------------------------------
+   private async recordAudio(maxSeconds: number): Promise<string | null> {
+     try {
+       // Try SoX `rec` first; if unavailable fall back to ffmpeg
+       try {
+         await execFileAsync('rec', [
+           '-r', '16000', '-c', '1', '-b', '16',
+           AUDIO_PATH,
+           'trim', '0', String(maxSeconds)
+         ], { timeout: (maxSeconds + 2) * 1000 });
+       } catch (recErr) {
+         const recMsg = (recErr as Error).message;
+         logger.warn('rec failed, falling back to ffmpeg', { error: recMsg });
+         // ffmpeg command for macOS capture via avfoundation
+         const ffmpegCmd = `ffmpeg -y -f avfoundation -i ":0" -t ${maxSeconds} -ar 16000 -ac 1 -ab 16k ${AUDIO_PATH}`;
+         await execFileAsync('bash', ['-c', ffmpegCmd], { timeout: (maxSeconds + 5) * 1000 });
+       }
+
+       const text = await sttProvider.transcribe(AUDIO_PATH);
+       try { unlinkSync(AUDIO_PATH); } catch { /* ignore */ }
+       return text;
+     } catch (error) {
+       const msg = (error as Error).message;
+       if (!msg.includes('timed out')) {
+         logger.error('Failed to capture audio', { error: msg });
+       }
+       return null;
+     }
+   }
 
   async listen(maxSeconds = 7): Promise<string | null> {
-    try {
-      await execFileAsync('rec', [
-        '-r', '16000', '-c', '1', '-b', '16',
-        AUDIO_PATH,
-        'trim', '0', String(maxSeconds)
-      ], { timeout: (maxSeconds + 2) * 1000 });
-
-      const text = await this.transcribe(AUDIO_PATH);
-      try { unlinkSync(AUDIO_PATH); } catch { /* ignore */ }
-      return text;
-    } catch (error) {
-      const msg = (error as Error).message;
-      if (!msg.includes('timed out')) {
-        logger.error('Failed to capture audio', { error: msg });
-      }
-      return null;
-    }
+    return this.recordAudio(maxSeconds);
   }
 
   async listenShort(maxSeconds = 2): Promise<string | null> {
-    try {
-      await execFileAsync('rec', [
-        '-r', '16000', '-c', '1', '-b', '16',
-        AUDIO_PATH,
-        'trim', '0', String(maxSeconds)
-      ], { timeout: (maxSeconds + 2) * 1000 });
-
-      const text = await this.transcribe(AUDIO_PATH);
-      try { unlinkSync(AUDIO_PATH); } catch { /* ignore */ }
-      return text;
-    } catch {
-      return null;
-    }
+    return this.recordAudio(maxSeconds);
   }
 
-  private async transcribe(audioPath: string): Promise<string> {
-    try {
-      const response = await this.client.audio.transcriptions.create({
-        model: 'whisper-large-v3',
-        file: createReadStream(audioPath),
-        language: 'en'
-      });
-      return (response.text || '').trim().toLowerCase();
-    } catch (error) {
-      logger.error('Transcription failed', { error: (error as Error).message });
-      return '';
-    }
-  }
-
-  async waitForWakeWord(wakeWord = 'tom'): Promise<void> {
+  // ---------------------------------------------------------------
+  // Wake‑word detection – simple polling loop using short recordings
+  // ---------------------------------------------------------------
+  async waitForWakeWord(wakeWord = 'jarvis'): Promise<void> {
     while (true) {
       const text = await this.listenShort(2);
-      if (text && text.includes(wakeWord)) {
+      if (text && text.toLowerCase().includes(wakeWord.toLowerCase())) {
         return;
       }
     }
