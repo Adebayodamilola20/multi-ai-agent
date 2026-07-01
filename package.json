@@ -7,6 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "jarvis": "ts-node-dev --respawn --transpile-only src/jarvis/index.ts",
     "lint": "tsc --noEmit",
     "test": "jest --passWithNoTests"
   },

@@ -36,7 +36,7 @@ export class Base44Service {
       logger.error('Base44 API error', { status: response.status, body: txt });
       throw new Error(`Base44 API error ${response.status}: ${txt}`);
     }
-    const data = await response.json();
-    return data?.content ?? '';
+const data = await response.json() as any;
+      return (data as any)?.content ?? '';
   }
 }
